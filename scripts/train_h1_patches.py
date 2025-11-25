@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, NamedTuple, Tuple
 
 import pandas as pd
 import pyro
@@ -19,6 +19,10 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
+from xfuse.data import Data, Dataset
+from xfuse.data.slide import Slide
+from xfuse.data.slide.data.slide_data import SlideData
+from xfuse.data.slide.iterator.slide_iterator import SlideIterator
 from xfuse.data.utility.misc import make_dataloader
 from xfuse.model import XFuse
 from xfuse.model.experiment.st import ST
@@ -40,51 +44,58 @@ def _load_counts(counts_csv: Path) -> Tuple[pd.DataFrame, List[str]]:
     return expression, genes
 
 
-class PatchGeneDataset(torch.utils.data.Dataset):
-    """Simple dataset that matches patch images with gene expression vectors."""
+class PatchSample(NamedTuple):
+    path: Path
+    name: str
+    gene_vector: torch.Tensor
 
-    def __init__(self, patch_dir: Path, counts_csv: Path, target_size: int = 256, margin: int = 4):
-        self.patch_dir = patch_dir
+
+class PatchSlideData(SlideData):
+    """Minimal :class:`SlideData` implementation for ST patch training."""
+
+    def __init__(self, samples: List[PatchSample], genes: List[str], target_size: int, margin: int = 4):
+        self.samples = samples
+        self._genes = genes
         self.target_size = target_size
         self.margin = margin
 
-        expression, genes = _load_counts(counts_csv)
-        self.genes = genes
+    @property
+    def data_type(self) -> str:
+        return "ST"
 
-        samples = []
-        for img_path in sorted(self.patch_dir.glob("*.png")):
-            name = img_path.stem
-            if name not in expression.index:
-                continue
-            samples.append((img_path, name, torch.as_tensor(expression.loc[name].values, dtype=torch.float32)))
+    @property
+    def genes(self) -> List[str]:
+        return list(self._genes)
 
-        if len(samples) == 0:
-            raise RuntimeError(
-                "No matching patch images and gene expressions were found. "
-                "Verify that patch PNG filenames match the portion of the spot ID after the underscore."
-            )
+    @genes.setter
+    def genes(self, genes: List[str]) -> "PatchSlideData":
+        self._genes = list(genes)
+        return self
 
-        self.samples = samples
+
+class PatchSlideIterator(SlideIterator):
+    def __init__(self, slide_data: PatchSlideData):
+        self.slide_data = slide_data
         self.transform = transforms.Compose(
-            [transforms.Resize((self.target_size, self.target_size)), transforms.ToTensor(),]
+            [transforms.Resize((self.slide_data.target_size, self.slide_data.target_size)), transforms.ToTensor(),]
         )
 
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def size(self, data_type=None, slide=None, covariate=None, condition=None) -> int:  # pylint: disable=unused-argument
-        return len(self.samples)
+    def __len__(self):
+        return len(self.slide_data.samples)
 
     def _make_label(self) -> torch.Tensor:
-        label = torch.zeros((self.target_size, self.target_size), dtype=torch.long)
-        if self.margin >= self.target_size // 2:
+        label = torch.zeros((self.slide_data.target_size, self.slide_data.target_size), dtype=torch.long)
+        if self.slide_data.margin >= self.slide_data.target_size // 2:
             label[...] = 1
             return label
-        label[self.margin : self.target_size - self.margin, self.margin : self.target_size - self.margin] = 1
+        label[
+            self.slide_data.margin : self.slide_data.target_size - self.slide_data.margin,
+            self.slide_data.margin : self.slide_data.target_size - self.slide_data.margin,
+        ] = 1
         return label
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        img_path, name, gene_vector = self.samples[idx]
+        img_path, name, gene_vector = self.slide_data.samples[idx]
 
         image = Image.open(img_path).convert("RGB")
         image = self.transform(image)
@@ -93,15 +104,32 @@ class PatchGeneDataset(torch.utils.data.Dataset):
         label = self._make_label()
         data = gene_vector.unsqueeze(0)
 
-        return {
-            "data_type": "ST",
-            "image": image,
-            "label": label,
-            "data": data,
-            "slide": "H1",
-            "covariates": {},
-            "name": name,
-        }
+        return {"image": image, "label": label, "data": data, "name": name}
+
+
+def _build_dataset(patch_dir: Path, counts_csv: Path, target_size: int = 256, margin: int = 4) -> Dataset:
+    expression, genes = _load_counts(counts_csv)
+
+    samples: List[PatchSample] = []
+    for img_path in sorted(patch_dir.glob("*.png")):
+        name = img_path.stem
+        if name not in expression.index:
+            continue
+        samples.append(
+            PatchSample(img_path, name, torch.as_tensor(expression.loc[name].values, dtype=torch.float32))
+        )
+
+    if len(samples) == 0:
+        raise RuntimeError(
+            "No matching patch images and gene expressions were found. "
+            "Verify that patch PNG filenames match the portion of the spot ID after the underscore."
+        )
+
+    slide_data = PatchSlideData(samples=samples, genes=genes, target_size=target_size, margin=margin)
+    design = pd.DataFrame(index=["H1"])
+    return Dataset(
+        Data(slides={"H1": Slide(slide_data, iterator=lambda data: PatchSlideIterator(data))}, design=design)
+    )
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -125,19 +153,22 @@ def _build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def _extract_features(model: XFuse, dataset: PatchGeneDataset, genes: List[str], device: torch.device, out_path: Path):
+def _extract_features(model: XFuse, dataset: Dataset, genes: List[str], device: torch.device, out_path: Path):
     model.eval()
     experiment = model.get_experiment("ST")
     feature_map: Dict[str, torch.Tensor] = {}
 
+    slide_data: PatchSlideData = dataset.data.slides["H1"].data  # type: ignore[assignment]
+    iterator = PatchSlideIterator(slide_data)
+
     with torch.no_grad(), Session(model=model, genes=genes, messengers=[]):
-        for sample in dataset:
+        for sample in iterator:
             x = {
                 "image": sample["image"].unsqueeze(0).to(device),
                 "label": sample["label"].unsqueeze(0).to(device),
                 "data": sample["data"].to(device),
-                "slide": [sample["slide"]],
-                "covariates": [sample["covariates"]],
+                "slide": ["H1"],
+                "covariates": [{}],
             }
             zs = experiment.guide(x)
             bottleneck = zs[-1].detach().cpu()
@@ -152,7 +183,7 @@ def main():
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    dataset = PatchGeneDataset(args.patch_dir, args.counts_csv)
+    dataset = _build_dataset(args.patch_dir, args.counts_csv)
     dataloader = make_dataloader(
         dataset,
         batch_size=min(args.batch_size, len(dataset)),
