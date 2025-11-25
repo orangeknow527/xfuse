@@ -32,10 +32,11 @@ def _load_counts(counts_csv: Path) -> Tuple[pd.DataFrame, List[str]]:
     if counts.shape[1] < 2:
         raise ValueError("count.csv must contain spot IDs and at least one gene column")
 
-    spot_ids = counts.iloc[:, 0].astype(str).str.split("_", n=1).str[-1]
-    counts.index = spot_ids
+    spot_ids = counts.iloc[:, 0].astype(str).str.strip().str.split("_", n=1).str[-1].str.strip()
     genes = counts.columns[1:].tolist()
-    expression = counts.iloc[:, 1:]
+
+    expression = counts.iloc[:, 1:].copy()
+    expression.index = spot_ids
     return expression, genes
 
 
@@ -58,7 +59,10 @@ class PatchGeneDataset(torch.utils.data.Dataset):
             samples.append((img_path, name, torch.as_tensor(expression.loc[name].values, dtype=torch.float32)))
 
         if len(samples) == 0:
-            raise RuntimeError("No matching patch images and gene expressions were found.")
+            raise RuntimeError(
+                "No matching patch images and gene expressions were found. "
+                "Verify that patch PNG filenames match the portion of the spot ID after the underscore."
+            )
 
         self.samples = samples
         self.transform = transforms.Compose(
