@@ -80,8 +80,8 @@ class Image(Experiment):
             return upsampler(y)
 
         y = _decode(zs[-1], self.depth - 1)
-        for i, z in zip(reversed(range(self.depth - 1)), zs[::-1][1:]):
-            y = _decode(_combine(_upsample(y, i), z, i), i)
+        for i in reversed(range(self.depth - 1)):
+            y = _decode(_upsample(y, i), i)
 
         return y
 
