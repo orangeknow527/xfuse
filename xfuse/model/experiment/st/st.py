@@ -334,23 +334,29 @@ class ST(Image):
 
         dataset = require("dataloader").dataset
 
-        def _compute_rim(decoded):
+        def _compute_rim(representation):
             shared_representation = get_module(
                 "metagene_shared",
                 lambda: torch.nn.Sequential(
                     torch.nn.Conv2d(
-                        decoded.shape[1], decoded.shape[1], kernel_size=1
+                        representation.shape[1],
+                        representation.shape[1],
+                        kernel_size=1,
                     ),
-                    torch.nn.BatchNorm2d(decoded.shape[1], momentum=0.05),
+                    torch.nn.BatchNorm2d(
+                        representation.shape[1], momentum=0.05
+                    ),
                     torch.nn.LeakyReLU(0.2, inplace=True),
                 ),
-            )(decoded)
+            )(representation)
             rim = torch.cat(
                 [
                     get_module(
                         f"decoder_{_encode_metagene_name(n)}",
                         partial(
-                            self._create_metagene_decoder, decoded.shape[1], n
+                            self._create_metagene_decoder,
+                            representation.shape[1],
+                            n,
                         ),
                     )(shared_representation)
                     for n in self.metagenes
@@ -361,9 +367,11 @@ class ST(Image):
             return rim
 
         decoded = self._decode(zs)
-        label = center_crop(x["label"], [None, *decoded.shape[-2:]])
+        bottleneck = zs[-1]
+        gene_representation = bottleneck.mean(dim=(2, 3), keepdim=True)
+        label = center_crop(x["label"], [None, *gene_representation.shape[-2:]])
 
-        rim = checkpoint(_compute_rim, decoded)
+        rim = checkpoint(_compute_rim, gene_representation)
         rim = center_crop(rim, [None, None, *label.shape[-2:]])
         rim = pyro.sample("rim", Delta(rim))
 
@@ -371,7 +379,9 @@ class ST(Image):
             "scale",
             Delta(
                 center_crop(
-                    self._get_scale_decoder(decoded.shape[1])(decoded),
+                    self._get_scale_decoder(gene_representation.shape[1])(
+                        gene_representation
+                    ),
                     [None, None, *label.shape[-2:]],
                 )
             ),
